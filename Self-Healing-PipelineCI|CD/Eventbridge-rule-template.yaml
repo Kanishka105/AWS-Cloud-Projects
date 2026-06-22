@@ -1,0 +1,62 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "EventBridge rule for self-healing CI/CD pipeline"
+
+Resources:
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SelfHealing-EventBridgeRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:SelfHealing-StateMachine"
+
+  CodeBuildFailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: SelfHealing-CodeBuildFailureRule
+      Description: "Triggers self-healing pipeline on CodeBuild failures"
+      EventPattern:
+        source:
+          - aws.codebuild
+        detail-type:
+          - CodeBuild Build State Change
+        detail:
+          build-status:
+            - FAILED
+            - FAULT
+            - STOPPED
+            - TIMED_OUT
+      State: ENABLED
+      Targets:
+        - Arn: !Sub "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:SelfHealing-StateMachine"
+          Id: SelfHealingTarget
+          RoleArn: !GetAtt EventBridgeRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              buildId: $.detail.build-id
+              projectName: $.detail.project-name
+              buildStatus: $.detail.build-status
+              logGroup: $.detail.additional-information.logs.group-name
+            InputTemplate: |
+              {
+                "buildFailure": {
+                  "buildId": "<buildId>",
+                  "projectName": "<projectName>",
+                  "buildStatus": "<buildStatus>",
+                  "logGroup": "<logGroup>",
+                  "timestamp": "<aws.events.event.ingestion-time>"
+                }
+              }
