@@ -1,0 +1,66 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Self-Healing CI/CD Knowledge Base"
+
+Resources:
+  SelfHealingKnowledgeBase:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: SelfHealingKnowledgeBase
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ErrorSignature
+          AttributeType: S
+        - AttributeName: ProjectName
+          AttributeType: S
+        - AttributeName: LastUsed
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ErrorSignature
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: ProjectNameIndex
+          KeySchema:
+            - AttributeName: ProjectName
+              KeyType: HASH
+            - AttributeName: LastUsed
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Project
+          Value: SelfHealingCICD
+        - Key: Environment
+          Value: Production
+
+  # SNS Topic for Developer Escalation
+  DeveloperEscalationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: SelfHealing-DeveloperEscalation
+      DisplayName: CI/CD Self-Healing Escalation
+      KmsMasterKeyId: alias/aws/sns
+
+  # SNS Subscription (replace with your email)
+  DeveloperEscalationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref DeveloperEscalationTopic
+      Endpoint: kanishkatomar55555@gmail.com # Replace with actual email
+
+Outputs:
+  KnowledgeBaseTableName:
+    Description: Name of the DynamoDB Knowledge Base table
+    Value: !Ref SelfHealingKnowledgeBase
+    Export:
+      Name: !Sub "${AWS::StackName}-KnowledgeBaseTable"
+
+  EscalationTopicArn:
+    Description: ARN of the SNS topic for escalations
+    Value: !Ref DeveloperEscalationTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-EscalationTopic"
