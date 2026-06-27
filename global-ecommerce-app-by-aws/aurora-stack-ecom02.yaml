@@ -1,0 +1,680 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Aurora MySQL Serverless v2 for E-commerce - Using Existing VPC"
+
+Parameters:
+  Environment:
+    Type: String
+    Default: "dev"
+    AllowedValues: ["dev", "staging", "prod"]
+    Description: Environment name
+
+Resources:
+  # DB Subnet Group using existing subnets
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "Subnet group for Aurora cluster using existing subnets"
+      SubnetIds:
+        - subnet-0207ac58e7d5429c6 # us-east-1a
+        - subnet-003304b18776e437c # us-east-1b
+        - subnet-0edbd359c87f112c2 # us-east-1c
+        - subnet-08f51ea850578ab8f # us-east-1d
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-db-subnet-group"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Security Group for Aurora
+  AuroraSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Security group for Aurora MySQL cluster"
+      VpcId: vpc-0a07fdead56748f13 # Your existing VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: "Allow MySQL access from Lambda functions"
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 172.31.0.0/16
+          Description: "Allow MySQL access from VPC"
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: "Allow all outbound traffic"
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-aurora-sg"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Security Group for Lambda functions
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Security group for Lambda functions accessing Aurora"
+      VpcId: vpc-0a07fdead56748f13 # Your existing VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: "Allow all outbound traffic"
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-lambda-sg"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Aurora Cluster Parameter Group
+  AuroraClusterParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Description: "Parameter group for Aurora MySQL cluster"
+      Family: aurora-mysql8.0
+      Parameters:
+        innodb_buffer_pool_size: "{DBInstanceClassMemory*3/4}"
+        max_connections: 1000
+        slow_query_log: 1
+        long_query_time: 2
+        general_log: 0
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-aurora-cluster-params"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Aurora DB Parameter Group
+  AuroraDBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: "Parameter group for Aurora MySQL instances"
+      Family: aurora-mysql8.0
+      Parameters:
+        innodb_print_all_deadlocks: 1
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-aurora-db-params"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # KMS Key for CloudWatch Logs
+  CloudWatchLogsKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: "KMS Key for CloudWatch Logs encryption"
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey"
+            Resource: "*"
+            Condition:
+              ArnEquals:
+                "kms:EncryptionContext:aws:logs:arn":
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/rds/cluster/${Environment}-ecommerce-aurora-cluster/error"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/rds/cluster/${Environment}-ecommerce-aurora-cluster/general"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/rds/cluster/${Environment}-ecommerce-aurora-cluster/slowquery"
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-cloudwatch-logs-kms-key"
+        - Key: Environment
+          Value: !Ref Environment
+
+  CloudWatchLogsKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${Environment}-cloudwatch-logs-key"
+      TargetKeyId: !Ref CloudWatchLogsKMSKey
+
+  # Aurora Cluster
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    Properties:
+      DBClusterIdentifier: !Sub "${Environment}-ecommerce-aurora-cluster"
+      Engine: aurora-mysql
+      EngineVersion: "8.0.mysql_aurora.3.04.3" # Valid LTS version compatible with MySQL 8.0.28
+      MasterUsername: admin
+      ManageMasterUserPassword: true # AWS manages the password
+      DatabaseName: ecommerce
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref AuroraSecurityGroup
+      DBClusterParameterGroupName: !Ref AuroraClusterParameterGroup
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 16
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: "03:00-04:00" # 3-4 AM UTC
+      PreferredMaintenanceWindow: "sun:04:00-sun:05:00" # Sunday 4-5 AM UTC
+      DeletionProtection: false # Set to true for production
+      StorageEncrypted: true
+      # Using AWS managed key instead of imported key to avoid dependency issues
+      EnableCloudwatchLogsExports:
+        - error
+        - general
+        - slowquery
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-ecommerce-aurora-cluster"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Aurora Writer Instance
+  AuroraWriterInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "${Environment}-ecommerce-aurora-writer"
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-mysql
+      DBParameterGroupName: !Ref AuroraDBParameterGroup
+      PubliclyAccessible: false
+      # Removed PerformanceInsightsEnabled - not supported for Serverless v2
+      # Removed MonitoringInterval and MonitoringRoleArn - limited support for Serverless v2
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-ecommerce-aurora-writer"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Aurora Reader Instance (Optional - for read scaling)
+  AuroraReaderInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "${Environment}-ecommerce-aurora-reader"
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-mysql
+      DBParameterGroupName: !Ref AuroraDBParameterGroup
+      PubliclyAccessible: false
+      # Removed PerformanceInsightsEnabled - not supported for Serverless v2
+      # Removed MonitoringInterval and MonitoringRoleArn - limited support for Serverless v2
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-ecommerce-aurora-reader"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Enhanced Monitoring Role (keeping for potential future use)
+  EnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Environment}-aurora-enhanced-monitoring-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Groups
+  ErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/rds/cluster/${Environment}-ecommerce-aurora-cluster/error"
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt CloudWatchLogsKMSKey.Arn
+
+  GeneralLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/rds/cluster/${Environment}-ecommerce-aurora-cluster/general"
+      RetentionInDays: 3
+      KmsKeyId: !GetAtt CloudWatchLogsKMSKey.Arn
+
+  SlowQueryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/rds/cluster/${Environment}-ecommerce-aurora-cluster/slowquery"
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt CloudWatchLogsKMSKey.Arn
+
+  # Secrets Manager Secret for Database Connection
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${Environment}/ecommerce/aurora/connection"
+      Description: "Aurora MySQL connection details for e-commerce application"
+      SecretString: !Sub |
+        {
+          "engine": "mysql",
+          "host": "${AuroraCluster.Endpoint.Address}",
+          "port": 3306,
+          "dbname": "ecommerce",
+          "username": "admin"
+        }
+      # Using AWS managed key for Secrets Manager
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  ClusterEndpoint:
+    Description: "Aurora cluster writer endpoint"
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+    Export:
+      Name: !Sub "${Environment}-Aurora-ClusterEndpoint"
+
+  ClusterReadEndpoint:
+    Description: "Aurora cluster reader endpoint"
+    Value: !GetAtt AuroraCluster.ReadEndpoint.Address
+    Export:
+      Name: !Sub "${Environment}-Aurora-ReadEndpoint"
+
+  ClusterPort:
+    Description: "Aurora cluster port"
+    Value: !GetAtt AuroraCluster.Endpoint.Port
+    Export:
+      Name: !Sub "${Environment}-Aurora-Port"
+
+  ClusterArn:
+    Description: "Aurora cluster ARN"
+    Value: !Sub "arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster:${AuroraCluster}"
+    Export:
+      Name: !Sub "${Environment}-Aurora-ClusterARN"
+
+  DatabaseName:
+    Description: "Database name"
+    Value: ecommerce
+    Export:
+      Name: !Sub "${Environment}-Aurora-DatabaseName"
+
+  LambdaSecurityGroupId:
+    Description: "Security Group ID for Lambda functions to access Aurora"
+    Value: !Ref LambdaSecurityGroup
+    Export:
+      Name: !Sub "${Environment}-Lambda-SecurityGroupId"
+
+  AuroraSecurityGroupId:
+    Description: "Security Group ID for Aurora cluster"
+    Value: !Ref AuroraSecurityGroup
+    Export:
+      Name: !Sub "${Environment}-Aurora-SecurityGroupId"
+
+  DatabaseSecretArn:
+    Description: "Secrets Manager secret ARN for database connection"
+    Value: !Ref DatabaseSecret
+    Export:
+      Name: !Sub "${Environment}-Aurora-SecretARN"
+
+  VpcId:
+    Description: "VPC ID (existing)"
+    Value: vpc-0a07fdead56748f13
+    Export:
+      Name: !Sub "${Environment}-VPC-ID"
+
+  CloudWatchLogsKMSKeyId:
+    Description: "KMS Key ID for CloudWatch Logs encryption"
+    Value: !Ref CloudWatchLogsKMSKey
+    Export:
+      Name: !Sub "${Environment}-CloudWatchLogs-KMSKeyId"
+
+  CloudWatchLogsKMSKeyArn:
+    Description: "KMS Key ARN for CloudWatch Logs encryption"
+    Value: !GetAtt CloudWatchLogsKMSKey.Arn
+    Export:
+      Name: !Sub "${Environment}-CloudWatchLogs-KMSKeyArn"
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Aurora MySQL Serverless v2 for E-commerce - Using Existing VPC"
+
+Parameters:
+  Environment:
+    Type: String
+    Default: "dev"
+    AllowedValues: ["dev", "staging", "prod"]
+    Description: Environment name
+
+Resources:
+  # DB Subnet Group using existing subnets
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: "Subnet group for Aurora cluster using existing subnets"
+      SubnetIds:
+        - subnet-0207ac58e7d5429c6 # us-east-1a
+        - subnet-003304b18776e437c # us-east-1b
+        - subnet-0edbd359c87f112c2 # us-east-1c
+        - subnet-08f51ea850578ab8f # us-east-1d
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-db-subnet-group"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Security Group for Aurora
+  AuroraSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Security group for Aurora MySQL cluster"
+      VpcId: vpc-0a07fdead56748f13 # Your existing VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: "Allow MySQL access from Lambda functions"
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 172.31.0.0/16
+          Description: "Allow MySQL access from VPC"
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: "Allow all outbound traffic"
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-aurora-sg"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Security Group for Lambda functions
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "Security group for Lambda functions accessing Aurora"
+      VpcId: vpc-0a07fdead56748f13 # Your existing VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: "Allow all outbound traffic"
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-lambda-sg"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Aurora Cluster Parameter Group
+  AuroraClusterParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Description: "Parameter group for Aurora MySQL cluster"
+      Family: aurora-mysql8.0
+      Parameters:
+        innodb_buffer_pool_size: "{DBInstanceClassMemory*3/4}"
+        max_connections: 1000
+        slow_query_log: 1
+        long_query_time: 2
+        general_log: 0
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-aurora-cluster-params"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Aurora DB Parameter Group
+  AuroraDBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: "Parameter group for Aurora MySQL instances"
+      Family: aurora-mysql8.0
+      Parameters:
+        innodb_print_all_deadlocks: 1
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-aurora-db-params"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # KMS Key for CloudWatch Logs
+  CloudWatchLogsKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: "KMS Key for CloudWatch Logs encryption"
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey"
+            Resource: "*"
+            Condition:
+              ArnEquals:
+                "kms:EncryptionContext:aws:logs:arn":
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/rds/cluster/${Environment}-ecommerce-aurora-cluster/error"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/rds/cluster/${Environment}-ecommerce-aurora-cluster/general"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/rds/cluster/${Environment}-ecommerce-aurora-cluster/slowquery"
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-cloudwatch-logs-kms-key"
+        - Key: Environment
+          Value: !Ref Environment
+
+  CloudWatchLogsKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${Environment}-cloudwatch-logs-key"
+      TargetKeyId: !Ref CloudWatchLogsKMSKey
+
+  # Aurora Cluster
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    Properties:
+      DBClusterIdentifier: !Sub "${Environment}-ecommerce-aurora-cluster"
+      Engine: aurora-mysql
+      EngineVersion: "8.0.mysql_aurora.3.04.3" # Valid LTS version compatible with MySQL 8.0.28
+      MasterUsername: admin
+      ManageMasterUserPassword: true # AWS manages the password
+      DatabaseName: ecommerce
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref AuroraSecurityGroup
+      DBClusterParameterGroupName: !Ref AuroraClusterParameterGroup
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 16
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: "03:00-04:00" # 3-4 AM UTC
+      PreferredMaintenanceWindow: "sun:04:00-sun:05:00" # Sunday 4-5 AM UTC
+      DeletionProtection: false # Set to true for production
+      StorageEncrypted: true
+      # Using AWS managed key instead of imported key to avoid dependency issues
+      EnableCloudwatchLogsExports:
+        - error
+        - general
+        - slowquery
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-ecommerce-aurora-cluster"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Aurora Writer Instance
+  AuroraWriterInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "${Environment}-ecommerce-aurora-writer"
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-mysql
+      DBParameterGroupName: !Ref AuroraDBParameterGroup
+      PubliclyAccessible: false
+      # Removed PerformanceInsightsEnabled - not supported for Serverless v2
+      # Removed MonitoringInterval and MonitoringRoleArn - limited support for Serverless v2
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-ecommerce-aurora-writer"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Aurora Reader Instance (Optional - for read scaling)
+  AuroraReaderInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub "${Environment}-ecommerce-aurora-reader"
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-mysql
+      DBParameterGroupName: !Ref AuroraDBParameterGroup
+      PubliclyAccessible: false
+      # Removed PerformanceInsightsEnabled - not supported for Serverless v2
+      # Removed MonitoringInterval and MonitoringRoleArn - limited support for Serverless v2
+      Tags:
+        - Key: Name
+          Value: !Sub "${Environment}-ecommerce-aurora-reader"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Enhanced Monitoring Role (keeping for potential future use)
+  EnhancedMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Environment}-aurora-enhanced-monitoring-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudWatch Log Groups
+  ErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/rds/cluster/${Environment}-ecommerce-aurora-cluster/error"
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt CloudWatchLogsKMSKey.Arn
+
+  GeneralLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/rds/cluster/${Environment}-ecommerce-aurora-cluster/general"
+      RetentionInDays: 3
+      KmsKeyId: !GetAtt CloudWatchLogsKMSKey.Arn
+
+  SlowQueryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/rds/cluster/${Environment}-ecommerce-aurora-cluster/slowquery"
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt CloudWatchLogsKMSKey.Arn
+
+  # Secrets Manager Secret for Database Connection
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${Environment}/ecommerce/aurora/connection"
+      Description: "Aurora MySQL connection details for e-commerce application"
+      SecretString: !Sub |
+        {
+          "engine": "mysql",
+          "host": "${AuroraCluster.Endpoint.Address}",
+          "port": 3306,
+          "dbname": "ecommerce",
+          "username": "admin"
+        }
+      # Using AWS managed key for Secrets Manager
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+Outputs:
+  ClusterEndpoint:
+    Description: "Aurora cluster writer endpoint"
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+    Export:
+      Name: !Sub "${Environment}-Aurora-ClusterEndpoint"
+
+  ClusterReadEndpoint:
+    Description: "Aurora cluster reader endpoint"
+    Value: !GetAtt AuroraCluster.ReadEndpoint.Address
+    Export:
+      Name: !Sub "${Environment}-Aurora-ReadEndpoint"
+
+  ClusterPort:
+    Description: "Aurora cluster port"
+    Value: !GetAtt AuroraCluster.Endpoint.Port
+    Export:
+      Name: !Sub "${Environment}-Aurora-Port"
+
+  ClusterArn:
+    Description: "Aurora cluster ARN"
+    Value: !Sub "arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster:${AuroraCluster}"
+    Export:
+      Name: !Sub "${Environment}-Aurora-ClusterARN"
+
+  DatabaseName:
+    Description: "Database name"
+    Value: ecommerce
+    Export:
+      Name: !Sub "${Environment}-Aurora-DatabaseName"
+
+  LambdaSecurityGroupId:
+    Description: "Security Group ID for Lambda functions to access Aurora"
+    Value: !Ref LambdaSecurityGroup
+    Export:
+      Name: !Sub "${Environment}-Lambda-SecurityGroupId"
+
+  AuroraSecurityGroupId:
+    Description: "Security Group ID for Aurora cluster"
+    Value: !Ref AuroraSecurityGroup
+    Export:
+      Name: !Sub "${Environment}-Aurora-SecurityGroupId"
+
+  DatabaseSecretArn:
+    Description: "Secrets Manager secret ARN for database connection"
+    Value: !Ref DatabaseSecret
+    Export:
+      Name: !Sub "${Environment}-Aurora-SecretARN"
+
+  VpcId:
+    Description: "VPC ID (existing)"
+    Value: vpc-0a07fdead56748f13
+    Export:
+      Name: !Sub "${Environment}-VPC-ID"
+
+  CloudWatchLogsKMSKeyId:
+    Description: "KMS Key ID for CloudWatch Logs encryption"
+    Value: !Ref CloudWatchLogsKMSKey
+    Export:
+      Name: !Sub "${Environment}-CloudWatchLogs-KMSKeyId"
+
+  CloudWatchLogsKMSKeyArn:
+    Description: "KMS Key ARN for CloudWatch Logs encryption"
+    Value: !GetAtt CloudWatchLogsKMSKey.Arn
+    Export:
+      Name: !Sub "${Environment}-CloudWatchLogs-KMSKeyArn"
