@@ -1,0 +1,346 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "E-commerce Event-Driven Architecture - EventBridge, SNS, SQS"
+
+Parameters:
+  Environment:
+    Type: String
+    Default: "dev"
+    AllowedValues: ["dev", "staging", "prod"]
+    Description: Environment name
+
+Resources:
+  # Custom EventBridge Bus (Fixed KmsKeyIdentifier property)
+  EcommerceEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub "${Environment}-ecommerce-events"
+      KmsKeyIdentifier: # Fixed: was KmsKeyId
+        Fn::ImportValue: !Sub "${Environment}-KMSKey-ID"
+
+  # SNS Topics
+  UserEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${Environment}-user-events"
+      KmsMasterKeyId:
+        Fn::ImportValue: !Sub "${Environment}-KMSKey-ID"
+
+  ProductEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${Environment}-product-events"
+      KmsMasterKeyId:
+        Fn::ImportValue: !Sub "${Environment}-KMSKey-ID"
+
+  OrderEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${Environment}-order-events"
+      KmsMasterKeyId:
+        Fn::ImportValue: !Sub "${Environment}-KMSKey-ID"
+
+  PaymentEventsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${Environment}-payment-events"
+      KmsMasterKeyId:
+        Fn::ImportValue: !Sub "${Environment}-KMSKey-ID"
+
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${Environment}-notifications"
+      KmsMasterKeyId:
+        Fn::ImportValue: !Sub "${Environment}-KMSKey-ID"
+
+  # SQS Queues (Fixed VisibilityTimeout property)
+  AnalyticsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Environment}-analytics-queue"
+      VisibilityTimeout: 300 # Fixed: was VisibilityTimeoutSeconds
+      MessageRetentionPeriod: 1209600 # 14 days
+      KmsMasterKeyId:
+        Fn::ImportValue: !Sub "${Environment}-KMSKey-ID"
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt AnalyticsDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  AnalyticsDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Environment}-analytics-dlq"
+      MessageRetentionPeriod: 1209600 # 14 days
+      KmsMasterKeyId:
+        Fn::ImportValue: !Sub "${Environment}-KMSKey-ID"
+
+  SearchIndexQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Environment}-search-index-queue"
+      VisibilityTimeout: 300 # Fixed: was VisibilityTimeoutSeconds
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId:
+        Fn::ImportValue: !Sub "${Environment}-KMSKey-ID"
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt SearchIndexDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  SearchIndexDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Environment}-search-index-dlq"
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId:
+        Fn::ImportValue: !Sub "${Environment}-KMSKey-ID"
+
+  NotificationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Environment}-notification-queue"
+      VisibilityTimeout: 300 # Fixed: was VisibilityTimeoutSeconds
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId:
+        Fn::ImportValue: !Sub "${Environment}-KMSKey-ID"
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt NotificationDeadLetterQueue.Arn
+        maxReceiveCount: 3
+
+  NotificationDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Environment}-notification-dlq"
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId:
+        Fn::ImportValue: !Sub "${Environment}-KMSKey-ID"
+
+  # EventBridge Rules (Removed SqsParameters for Standard Queues)
+  UserRegisteredRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${Environment}-user-registered-rule"
+      EventBusName: !Ref EcommerceEventBus
+      EventPattern:
+        source: ["ecommerce.user"]
+        detail-type: ["User Registered"]
+      State: ENABLED
+      Targets:
+        - Arn: !Ref UserEventsTopic
+          Id: UserEventsTarget
+        - Arn: !GetAtt AnalyticsQueue.Arn
+          Id: AnalyticsTarget
+
+  ProductCreatedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${Environment}-product-created-rule"
+      EventBusName: !Ref EcommerceEventBus
+      EventPattern:
+        source: ["ecommerce.product"]
+        detail-type: ["Product Created", "Product Updated"]
+      State: ENABLED
+      Targets:
+        - Arn: !Ref ProductEventsTopic
+          Id: ProductEventsTarget
+        - Arn: !GetAtt SearchIndexQueue.Arn
+          Id: SearchIndexTarget
+        - Arn: !GetAtt AnalyticsQueue.Arn
+          Id: AnalyticsTarget
+
+  OrderCreatedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${Environment}-order-created-rule"
+      EventBusName: !Ref EcommerceEventBus
+      EventPattern:
+        source: ["ecommerce.order"]
+        detail-type:
+          ["Order Created", "Order Updated", "Order Shipped", "Order Delivered"]
+      State: ENABLED
+      Targets:
+        - Arn: !Ref OrderEventsTopic
+          Id: OrderEventsTarget
+        - Arn: !GetAtt NotificationQueue.Arn
+          Id: NotificationTarget
+        - Arn: !GetAtt AnalyticsQueue.Arn
+          Id: AnalyticsTarget
+
+  PaymentCompletedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${Environment}-payment-completed-rule"
+      EventBusName: !Ref EcommerceEventBus
+      EventPattern:
+        source: ["ecommerce.payment"]
+        detail-type: ["Payment Completed", "Payment Failed", "Payment Refunded"]
+      State: ENABLED
+      Targets:
+        - Arn: !Ref PaymentEventsTopic
+          Id: PaymentEventsTarget
+        - Arn: !GetAtt NotificationQueue.Arn
+          Id: NotificationTarget
+        - Arn: !GetAtt AnalyticsQueue.Arn
+          Id: AnalyticsTarget
+
+  # SNS Subscriptions to SQS
+  UserEventsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref UserEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt NotificationQueue.Arn
+
+  ProductEventsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref ProductEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt SearchIndexQueue.Arn
+
+  OrderEventsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref OrderEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt NotificationQueue.Arn
+
+  PaymentEventsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref PaymentEventsTopic
+      Protocol: sqs
+      Endpoint: !GetAtt NotificationQueue.Arn
+
+  # IAM Permissions for EventBridge to SNS/SQS
+  EventBridgeToSNSPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref UserEventsTopic
+        - !Ref ProductEventsTopic
+        - !Ref OrderEventsTopic
+        - !Ref PaymentEventsTopic
+        - !Ref NotificationTopic
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: "*"
+
+  EventBridgeToSQSPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref AnalyticsQueue
+        - !Ref SearchIndexQueue
+        - !Ref NotificationQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: "*"
+
+  # SNS to SQS Policy for subscriptions
+  SNSToSQSPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref NotificationQueue
+        - !Ref SearchIndexQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: "*"
+            Condition:
+              ArnEquals:
+                aws:SourceArn:
+                  - !Ref UserEventsTopic
+                  - !Ref ProductEventsTopic
+                  - !Ref OrderEventsTopic
+                  - !Ref PaymentEventsTopic
+
+Outputs:
+  EcommerceEventBusArn:
+    Description: EventBridge Custom Bus ARN
+    Value: !GetAtt EcommerceEventBus.Arn
+    Export:
+      Name: !Sub "${Environment}-EventBus-ARN"
+
+  EcommerceEventBusName:
+    Description: EventBridge Custom Bus Name
+    Value: !Ref EcommerceEventBus
+    Export:
+      Name: !Sub "${Environment}-EventBus-Name"
+
+  AnalyticsQueueArn:
+    Description: Analytics Queue ARN
+    Value: !GetAtt AnalyticsQueue.Arn
+    Export:
+      Name: !Sub "${Environment}-AnalyticsQueue-ARN"
+
+  AnalyticsQueueUrl:
+    Description: Analytics Queue URL
+    Value: !Ref AnalyticsQueue
+    Export:
+      Name: !Sub "${Environment}-AnalyticsQueue-URL"
+
+  SearchIndexQueueArn:
+    Description: Search Index Queue ARN
+    Value: !GetAtt SearchIndexQueue.Arn
+    Export:
+      Name: !Sub "${Environment}-SearchIndexQueue-ARN"
+
+  SearchIndexQueueUrl:
+    Description: Search Index Queue URL
+    Value: !Ref SearchIndexQueue
+    Export:
+      Name: !Sub "${Environment}-SearchIndexQueue-URL"
+
+  NotificationQueueArn:
+    Description: Notification Queue ARN
+    Value: !GetAtt NotificationQueue.Arn
+    Export:
+      Name: !Sub "${Environment}-NotificationQueue-ARN"
+
+  NotificationQueueUrl:
+    Description: Notification Queue URL
+    Value: !Ref NotificationQueue
+    Export:
+      Name: !Sub "${Environment}-NotificationQueue-URL"
+
+  UserEventsTopicArn:
+    Description: User Events Topic ARN
+    Value: !Ref UserEventsTopic
+    Export:
+      Name: !Sub "${Environment}-UserEventsTopic-ARN"
+
+  ProductEventsTopicArn:
+    Description: Product Events Topic ARN
+    Value: !Ref ProductEventsTopic
+    Export:
+      Name: !Sub "${Environment}-ProductEventsTopic-ARN"
+
+  OrderEventsTopicArn:
+    Description: Order Events Topic ARN
+    Value: !Ref OrderEventsTopic
+    Export:
+      Name: !Sub "${Environment}-OrderEventsTopic-ARN"
+
+  PaymentEventsTopicArn:
+    Description: Payment Events Topic ARN
+    Value: !Ref PaymentEventsTopic
+    Export:
+      Name: !Sub "${Environment}-PaymentEventsTopic-ARN"
+
+  NotificationTopicArn:
+    Description: Notification Topic ARN
+    Value: !Ref NotificationTopic
+    Export:
+      Name: !Sub "${Environment}-NotificationTopic-ARN"
