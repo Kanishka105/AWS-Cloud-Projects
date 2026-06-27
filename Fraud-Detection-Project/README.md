@@ -1,2 +1,2 @@
 Full Project Documentation on Fraud Detection
-Link: ./Fraud-Detection-Project/kanishka_frauddetection_aws project.pdf
+👉 **[Click here to view/download the full AWS Project Architecture PDF](./kanishka_frauddetection_aws.pdf)**
