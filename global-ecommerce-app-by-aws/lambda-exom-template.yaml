@@ -1,0 +1,1189 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Complete E-commerce Microservices Platform with Lambda Functions"
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+
+  Region:
+    Type: String
+    Default: us-east-1
+    Description: AWS Region for deployment
+
+Resources:
+  # ============================================================================
+  # LAMBDA FUNCTIONS
+  # ============================================================================
+
+  # Payment Service Lambda
+  PaymentServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-ecommerce-payment-service"
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/${Environment}-ecommerce-lambda-role"
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          PAYMENTS_TABLE: !Sub "${Environment}-payments"
+          ORDERS_TABLE: !Sub "${Environment}-orders"
+          EVENT_BUS_NAME: !Sub "${Environment}-ecommerce-events"
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          const eventbridge = new AWS.EventBridge();
+
+          const PAYMENTS_TABLE = process.env.PAYMENTS_TABLE;
+          const ORDERS_TABLE = process.env.ORDERS_TABLE;
+          const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME;
+
+          exports.handler = async (event) => {
+              console.log('Payment Service Event:', JSON.stringify(event, null, 2));
+              const { httpMethod, pathParameters, body } = event;
+              
+              try {
+                  switch (httpMethod) {
+                      case 'POST':
+                          return await processPayment(JSON.parse(body));
+                      case 'GET':
+                          if (pathParameters && pathParameters.paymentId) {
+                              return await getPayment(pathParameters.paymentId);
+                          }
+                          return await getPayments();
+                      case 'PUT':
+                          return await updatePaymentStatus(pathParameters.paymentId, JSON.parse(body));
+                      default:
+                          return {
+                              statusCode: 405,
+                              body: JSON.stringify({ message: 'Method not allowed' })
+                          };
+                  }
+              } catch (error) {
+                  console.error('Error:', error);
+                  return {
+                      statusCode: 500,
+                      body: JSON.stringify({ message: 'Internal server error', error: error.message })
+                  };
+              }
+          };
+
+          async function processPayment(paymentData) {
+              const paymentId = `pay-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+              const timestamp = new Date().toISOString();
+              
+              // Simulate payment processing logic
+              const paymentStatus = Math.random() > 0.1 ? 'completed' : 'failed';
+              
+              const payment = {
+                  paymentId,
+                  orderId: paymentData.orderId,
+                  userId: paymentData.userId,
+                  amount: paymentData.amount,
+                  currency: paymentData.currency || 'USD',
+                  paymentMethod: paymentData.paymentMethod,
+                  status: paymentStatus,
+                  transactionId: `txn-${Date.now()}`,
+                  createdAt: timestamp,
+                  updatedAt: timestamp
+              };
+              
+              // Save payment to DynamoDB
+              await dynamodb.put({
+                  TableName: PAYMENTS_TABLE,
+                  Item: payment
+              }).promise();
+              
+              // Update order status
+              if (paymentStatus === 'completed') {
+                  await dynamodb.update({
+                      TableName: ORDERS_TABLE,
+                      Key: { orderId: paymentData.orderId },
+                      UpdateExpression: 'SET #status = :status, updatedAt = :timestamp',
+                      ExpressionAttributeNames: { '#status': 'status' },
+                      ExpressionAttributeValues: {
+                          ':status': 'paid',
+                          ':timestamp': timestamp
+                      }
+                  }).promise();
+              }
+              
+              // Publish event
+              await publishEvent('ecommerce.payment', 'Payment Processed', {
+                  paymentId: payment.paymentId,
+                  orderId: payment.orderId,
+                  status: paymentStatus,
+                  amount: payment.amount,
+                  timestamp
+              });
+              
+              return {
+                  statusCode: 201,
+                  headers: {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  body: JSON.stringify({ payment })
+              };
+          }
+
+          async function getPayment(paymentId) {
+              const result = await dynamodb.get({
+                  TableName: PAYMENTS_TABLE,
+                  Key: { paymentId }
+              }).promise();
+              
+              if (!result.Item) {
+                  return {
+                      statusCode: 404,
+                      body: JSON.stringify({ message: 'Payment not found' })
+                  };
+              }
+              
+              return {
+                  statusCode: 200,
+                  headers: {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  body: JSON.stringify({ payment: result.Item })
+              };
+          }
+
+          async function getPayments() {
+              const result = await dynamodb.scan({
+                  TableName: PAYMENTS_TABLE
+              }).promise();
+              
+              return {
+                  statusCode: 200,
+                  headers: {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  body: JSON.stringify({ payments: result.Items })
+              };
+          }
+
+          async function updatePaymentStatus(paymentId, updateData) {
+              const timestamp = new Date().toISOString();
+              
+              const result = await dynamodb.update({
+                  TableName: PAYMENTS_TABLE,
+                  Key: { paymentId },
+                  UpdateExpression: 'SET #status = :status, updatedAt = :timestamp',
+                  ExpressionAttributeNames: { '#status': 'status' },
+                  ExpressionAttributeValues: {
+                      ':status': updateData.status,
+                      ':timestamp': timestamp
+                  },
+                  ReturnValues: 'ALL_NEW'
+              }).promise();
+              
+              return {
+                  statusCode: 200,
+                  headers: {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  body: JSON.stringify({ payment: result.Attributes })
+              };
+          }
+
+          async function publishEvent(source, detailType, detail) {
+              const params = {
+                  Entries: [{
+                      Source: source,
+                      DetailType: detailType,
+                      Detail: JSON.stringify(detail),
+                      EventBusName: EVENT_BUS_NAME
+                  }]
+              };
+              
+              await eventbridge.putEvents(params).promise();
+          }
+
+  # Inventory Service Lambda
+  InventoryServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-ecommerce-inventory-service"
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/${Environment}-ecommerce-lambda-role"
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          INVENTORY_TABLE: !Sub "${Environment}-inventory"
+          PRODUCTS_TABLE: !Sub "${Environment}-products"
+          EVENT_BUS_NAME: !Sub "${Environment}-ecommerce-events"
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          const eventbridge = new AWS.EventBridge();
+
+          const INVENTORY_TABLE = process.env.INVENTORY_TABLE;
+          const PRODUCTS_TABLE = process.env.PRODUCTS_TABLE;
+          const EVENT_BUS_NAME = process.env.EVENT_BUS_NAME;
+
+          exports.handler = async (event) => {
+              console.log('Inventory Service Event:', JSON.stringify(event, null, 2));
+              const { httpMethod, pathParameters, body, queryStringParameters } = event;
+              
+              try {
+                  switch (httpMethod) {
+                      case 'POST':
+                          return await updateInventory(JSON.parse(body));
+                      case 'GET':
+                          if (pathParameters && pathParameters.productId) {
+                              return await getInventory(pathParameters.productId);
+                          }
+                          return await getAllInventory(queryStringParameters);
+                      case 'PUT':
+                          return await reserveInventory(pathParameters.productId, JSON.parse(body));
+                      default:
+                          return {
+                              statusCode: 405,
+                              body: JSON.stringify({ message: 'Method not allowed' })
+                          };
+                  }
+              } catch (error) {
+                  console.error('Error:', error);
+                  return {
+                      statusCode: 500,
+                      body: JSON.stringify({ message: 'Internal server error', error: error.message })
+                  };
+              }
+          };
+
+          async function updateInventory(inventoryData) {
+              const timestamp = new Date().toISOString();
+              
+              const params = {
+                  TableName: INVENTORY_TABLE,
+                  Key: { productId: inventoryData.productId },
+                  UpdateExpression: 'SET quantity = quantity + :change, updatedAt = :timestamp',
+                  ExpressionAttributeValues: {
+                      ':change': inventoryData.quantityChange,
+                      ':timestamp': timestamp
+                  },
+                  ReturnValues: 'ALL_NEW'
+              };
+              
+              const result = await dynamodb.update(params).promise();
+              
+              // Publish inventory update event
+              await publishEvent('ecommerce.inventory', 'Inventory Updated', {
+                  productId: inventoryData.productId,
+                  newQuantity: result.Attributes.quantity,
+                  change: inventoryData.quantityChange,
+                  timestamp
+              });
+              
+              return {
+                  statusCode: 200,
+                  headers: {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  body: JSON.stringify({ inventory: result.Attributes })
+              };
+          }
+
+          async function getInventory(productId) {
+              const result = await dynamodb.get({
+                  TableName: INVENTORY_TABLE,
+                  Key: { productId }
+              }).promise();
+              
+              if (!result.Item) {
+                  return {
+                      statusCode: 404,
+                      body: JSON.stringify({ message: 'Inventory not found' })
+                  };
+              }
+              
+              return {
+                  statusCode: 200,
+                  headers: {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  body: JSON.stringify({ inventory: result.Item })
+              };
+          }
+
+          async function getAllInventory(queryParams) {
+              let params = { TableName: INVENTORY_TABLE };
+              
+              // Filter by low stock if requested
+              if (queryParams && queryParams.lowStock === 'true') {
+                  params.FilterExpression = 'quantity < :threshold';
+                  params.ExpressionAttributeValues = { ':threshold': 10 };
+              }
+              
+              const result = await dynamodb.scan(params).promise();
+              
+              return {
+                  statusCode: 200,
+                  headers: {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  body: JSON.stringify({ inventory: result.Items })
+              };
+          }
+
+          async function reserveInventory(productId, reservationData) {
+              const timestamp = new Date().toISOString();
+              
+              try {
+                  const result = await dynamodb.update({
+                      TableName: INVENTORY_TABLE,
+                      Key: { productId },
+                      UpdateExpression: 'SET reservedQuantity = reservedQuantity + :reserve, updatedAt = :timestamp',
+                      ConditionExpression: 'quantity >= reservedQuantity + :reserve',
+                      ExpressionAttributeValues: {
+                          ':reserve': reservationData.quantity,
+                          ':timestamp': timestamp
+                      },
+                      ReturnValues: 'ALL_NEW'
+                  }).promise();
+                  
+                  return {
+                      statusCode: 200,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      body: JSON.stringify({ 
+                          success: true, 
+                          inventory: result.Attributes 
+                      })
+                  };
+              } catch (error) {
+                  if (error.code === 'ConditionalCheckFailedException') {
+                      return {
+                          statusCode: 400,
+                          body: JSON.stringify({ 
+                              success: false, 
+                              message: 'Insufficient inventory' 
+                          })
+                      };
+                  }
+                  throw error;
+              }
+          }
+
+          async function publishEvent(source, detailType, detail) {
+              const params = {
+                  Entries: [{
+                      Source: source,
+                      DetailType: detailType,
+                      Detail: JSON.stringify(detail),
+                      EventBusName: EVENT_BUS_NAME
+                  }]
+              };
+              
+              await eventbridge.putEvents(params).promise();
+          }
+
+  # Notification Service Lambda
+  NotificationServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-ecommerce-notification-service"
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/${Environment}-ecommerce-lambda-role"
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Sub "${Environment}-ecommerce-events"
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const sns = new AWS.SNS();
+          const ses = new AWS.SES();
+
+          exports.handler = async (event) => {
+              console.log('Notification Service Event:', JSON.stringify(event, null, 2));
+              
+              try {
+                  // Handle EventBridge events
+                  if (event.source) {
+                      return await handleEventBridgeEvent(event);
+                  }
+                  
+                  // Handle direct API calls
+                  const { httpMethod, body } = event;
+                  
+                  if (httpMethod === 'POST') {
+                      return await sendNotification(JSON.parse(body));
+                  }
+                  
+                  return {
+                      statusCode: 405,
+                      body: JSON.stringify({ message: 'Method not allowed' })
+                  };
+              } catch (error) {
+                  console.error('Error:', error);
+                  return {
+                      statusCode: 500,
+                      body: JSON.stringify({ message: 'Internal server error', error: error.message })
+                  };
+              }
+          };
+
+          async function handleEventBridgeEvent(event) {
+              console.log('Processing EventBridge event:', event);
+              
+              const { source, 'detail-type': detailType, detail } = event;
+              
+              switch (source) {
+                  case 'ecommerce.user':
+                      if (detailType === 'User Registered') {
+                          await sendWelcomeEmail(detail);
+                      }
+                      break;
+                  case 'ecommerce.order':
+                      if (detailType === 'Order Created') {
+                          await sendOrderConfirmation(detail);
+                      } else if (detailType === 'Order Status Changed') {
+                          await sendOrderStatusUpdate(detail);
+                      }
+                      break;
+                  case 'ecommerce.payment':
+                      if (detailType === 'Payment Processed') {
+                          await sendPaymentNotification(detail);
+                      }
+                      break;
+                  case 'ecommerce.inventory':
+                      if (detailType === 'Inventory Updated') {
+                          await checkLowStockAlert(detail);
+                      }
+                      break;
+              }
+              
+              return { statusCode: 200 };
+          }
+
+          async function sendNotification(notificationData) {
+              const { type, recipient, message, subject } = notificationData;
+              
+              try {
+                  if (type === 'email') {
+                      await sendEmail(recipient, subject, message);
+                  } else if (type === 'sms') {
+                      await sendSMS(recipient, message);
+                  }
+                  
+                  return {
+                      statusCode: 200,
+                      headers: {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      body: JSON.stringify({ success: true, message: 'Notification sent' })
+                  };
+              } catch (error) {
+                  console.error('Notification error:', error);
+                  return {
+                      statusCode: 500,
+                      body: JSON.stringify({ success: false, error: error.message })
+                  };
+              }
+          }
+
+          async function sendWelcomeEmail(userDetail) {
+              const subject = 'Welcome to Our E-commerce Platform!';
+              const message = `
+                  Welcome ${userDetail.email}!
+                  
+                  Thank you for joining our e-commerce platform. We're excited to have you as a customer.
+                  
+                  Start exploring our products and enjoy shopping with us!
+                  
+                  Best regards,
+                  The E-commerce Team
+              `;
+              
+              console.log(`Sending welcome email to: ${userDetail.email}`);
+              // In production, implement actual email sending
+          }
+
+          async function sendOrderConfirmation(orderDetail) {
+              const subject = `Order Confirmation - ${orderDetail.orderId}`;
+              const message = `
+                  Your order has been confirmed!
+                  
+                  Order ID: ${orderDetail.orderId}
+                  Total: $${orderDetail.totalAmount}
+                  
+                  We'll send you updates as your order is processed.
+                  
+                  Thank you for your purchase!
+              `;
+              
+              console.log(`Sending order confirmation for: ${orderDetail.orderId}`);
+              // In production, implement actual email sending
+          }
+
+          async function sendOrderStatusUpdate(orderDetail) {
+              console.log(`Order status update: ${orderDetail.orderId} - ${orderDetail.status}`);
+              // In production, implement actual notification sending
+          }
+
+          async function sendPaymentNotification(paymentDetail) {
+              console.log(`Payment notification: ${paymentDetail.paymentId} - ${paymentDetail.status}`);
+              // In production, implement actual notification sending
+          }
+
+          async function checkLowStockAlert(inventoryDetail) {
+              if (inventoryDetail.newQuantity < 5) {
+                  console.log(`LOW STOCK ALERT: Product ${inventoryDetail.productId} has only ${inventoryDetail.newQuantity} items left`);
+                  // In production, send alert to inventory managers
+              }
+          }
+
+          async function sendEmail(recipient, subject, message) {
+              // Placeholder for SES email sending
+              console.log(`Email to ${recipient}: ${subject}`);
+          }
+
+          async function sendSMS(recipient, message) {
+              // Placeholder for SNS SMS sending
+              console.log(`SMS to ${recipient}: ${message}`);
+          }
+
+  # Analytics Service Lambda
+  AnalyticsServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-ecommerce-analytics-service"
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/${Environment}-ecommerce-lambda-role"
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          ORDERS_TABLE: !Sub "${Environment}-orders"
+          PRODUCTS_TABLE: !Sub "${Environment}-products"
+          USERS_TABLE: !Sub "${Environment}-users"
+          PAYMENTS_TABLE: !Sub "${Environment}-payments"
+          EVENT_BUS_NAME: !Sub "${Environment}-ecommerce-events"
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+          const ORDERS_TABLE = process.env.ORDERS_TABLE;
+          const PRODUCTS_TABLE = process.env.PRODUCTS_TABLE;
+          const USERS_TABLE = process.env.USERS_TABLE;
+          const PAYMENTS_TABLE = process.env.PAYMENTS_TABLE;
+
+          exports.handler = async (event) => {
+              console.log('Analytics Service Event:', JSON.stringify(event, null, 2));
+              const { httpMethod, pathParameters, queryStringParameters } = event;
+              
+              try {
+                  switch (httpMethod) {
+                      case 'GET':
+                          if (pathParameters) {
+                              const reportType = pathParameters.reportType;
+                              return await generateReport(reportType, queryStringParameters);
+                          }
+                          return await getDashboardData();
+                      default:
+                          return {
+                              statusCode: 405,
+                              body: JSON.stringify({ message: 'Method not allowed' })
+                          };
+                  }
+              } catch (error) {
+                  console.error('Error:', error);
+                  return {
+                      statusCode: 500,
+                      body: JSON.stringify({ message: 'Internal server error', error: error.message })
+                  };
+              }
+          };
+
+          async function getDashboardData() {
+              const [orders, users, products, payments] = await Promise.all([
+                  dynamodb.scan({ TableName: ORDERS_TABLE }).promise(),
+                  dynamodb.scan({ TableName: USERS_TABLE }).promise(),
+                  dynamodb.scan({ TableName: PRODUCTS_TABLE }).promise(),
+                  dynamodb.scan({ TableName: PAYMENTS_TABLE }).promise()
+              ]);
+              
+              const totalRevenue = payments.Items
+                  .filter(p => p.status === 'completed')
+                  .reduce((sum, p) => sum + (p.amount || 0), 0);
+              
+              const totalOrders = orders.Items.length;
+              const totalUsers = users.Items.length;
+              const totalProducts = products.Items.length;
+              
+              const averageOrderValue = totalOrders > 0 ? totalRevenue / totalOrders : 0;
+              
+              const dashboard = {
+                  totalRevenue,
+                  totalOrders,
+                  totalUsers,
+                  totalProducts,
+                  averageOrderValue,
+                  conversionRate: totalUsers > 0 ? (totalOrders / totalUsers * 100).toFixed(2) : 0
+              };
+              
+              return {
+                  statusCode: 200,
+                  headers: {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  body: JSON.stringify({ dashboard })
+              };
+          }
+
+          async function generateReport(reportType, queryParams) {
+              const startDate = queryParams?.startDate || new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+              const endDate = queryParams?.endDate || new Date().toISOString();
+              
+              let report;
+              
+              switch (reportType) {
+                  case 'sales':
+                      report = await generateSalesReport(startDate, endDate);
+                      break;
+                  case 'products':
+                      report = await generateProductReport();
+                      break;
+                  case 'users':
+                      report = await generateUserReport(startDate, endDate);
+                      break;
+                  case 'revenue':
+                      report = await generateRevenueReport(startDate, endDate);
+                      break;
+                  default:
+                      return {
+                          statusCode: 400,
+                          body: JSON.stringify({ message: 'Invalid report type' })
+                      };
+              }
+              
+              return {
+                  statusCode: 200,
+                  headers: {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  body: JSON.stringify({ report, reportType, period: { startDate, endDate } })
+              };
+          }
+
+          async function generateSalesReport(startDate, endDate) {
+              const orders = await dynamodb.scan({
+                  TableName: ORDERS_TABLE,
+                  FilterExpression: 'createdAt BETWEEN :start AND :end',
+                  ExpressionAttributeValues: {
+                      ':start': startDate,
+                      ':end': endDate
+                  }
+              }).promise();
+              
+              const salesByDay = {};
+              const salesByStatus = {};
+              
+              orders.Items.forEach(order => {
+                  const day = order.createdAt.split('T')[0];
+                  salesByDay[day] = (salesByDay[day] || 0) + 1;
+                  salesByStatus[order.status] = (salesByStatus[order.status] || 0) + 1;
+              });
+              
+              return {
+                  totalOrders: orders.Items.length,
+                  salesByDay,
+                  salesByStatus,
+                  averageOrdersPerDay: Object.keys(salesByDay).length > 0 ? 
+                      orders.Items.length / Object.keys(salesByDay).length : 0
+              };
+          }
+
+          async function generateProductReport() {
+              const [products, orders] = await Promise.all([
+                  dynamodb.scan({ TableName: PRODUCTS_TABLE }).promise(),
+                  dynamodb.scan({ TableName: ORDERS_TABLE }).promise()
+              ]);
+              
+              const productSales = {};
+              const categoryStats = {};
+              
+              // Count product sales from orders
+              orders.Items.forEach(order => {
+                  if (order.items) {
+                      order.items.forEach(item => {
+                          productSales[item.productId] = (productSales[item.productId] || 0) + item.quantity;
+                      });
+                  }
+              });
+              
+              // Analyze by category
+              products.Items.forEach(product => {
+                  const category = product.category || 'Uncategorized';
+                  if (!categoryStats[category]) {
+                      categoryStats[category] = { count: 0, totalSales: 0 };
+                  }
+                  categoryStats[category].count++;
+                  categoryStats[category].totalSales += productSales[product.productId] || 0;
+              });
+              
+              return {
+                  totalProducts: products.Items.length,
+                  productSales,
+                  categoryStats,
+                  topSellingProducts: Object.entries(productSales)
+                      .sort(([,a], [,b]) => b - a)
+                      .slice(0, 10)
+              };
+          }
+
+          async function generateUserReport(startDate, endDate) {
+              const users = await dynamodb.scan({
+                  TableName: USERS_TABLE,
+                  FilterExpression: 'createdAt BETWEEN :start AND :end',
+                  ExpressionAttributeValues: {
+                      ':start': startDate,
+                      ':end': endDate
+                  }
+              }).promise();
+              
+              const usersByCountry = {};
+              const usersByDay = {};
+              
+              users.Items.forEach(user => {
+                  const country = user.country || 'Unknown';
+                  const day = user.createdAt.split('T')[0];
+                  
+                  usersByCountry[country] = (usersByCountry[country] || 0) + 1;
+                  usersByDay[day] = (usersByDay[day] || 0) + 1;
+              });
+              
+              return {
+                  newUsers: users.Items.length,
+                  usersByCountry,
+                  usersByDay,
+                  averageUsersPerDay: Object.keys(usersByDay).length > 0 ? 
+                      users.Items.length / Object.keys(usersByDay).length : 0
+              };
+          }
+
+          async function generateRevenueReport(startDate, endDate) {
+              const payments = await dynamodb.scan({
+                  TableName: PAYMENTS_TABLE,
+                  FilterExpression: 'createdAt BETWEEN :start AND :end AND #status = :status',
+                  ExpressionAttributeNames: { '#status': 'status' },
+                  ExpressionAttributeValues: {
+                      ':start': startDate,
+                      ':end': endDate,
+                      ':status': 'completed'
+                  }
+              }).promise();
+              
+              const revenueByDay = {};
+              const revenueByCurrency = {};
+              let totalRevenue = 0;
+              
+              payments.Items.forEach(payment => {
+                  const day = payment.createdAt.split('T')[0];
+                  const currency = payment.currency || 'USD';
+                  const amount = payment.amount || 0;
+                  
+                  revenueByDay[day] = (revenueByDay[day] || 0) + amount;
+                  revenueByCurrency[currency] = (revenueByCurrency[currency] || 0) + amount;
+                  totalRevenue += amount;
+              });
+              
+              return {
+                  totalRevenue,
+                  revenueByDay,
+                  revenueByCurrency,
+                  averageRevenuePerDay: Object.keys(revenueByDay).length > 0 ? 
+                      totalRevenue / Object.keys(revenueByDay).length : 0,
+                  totalTransactions: payments.Items.length
+              };
+          }
+
+  # Search Service Lambda
+  SearchServiceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-ecommerce-search-service"
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !Sub "arn:aws:iam::${AWS::AccountId}:role/${Environment}-ecommerce-lambda-role"
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          PRODUCTS_TABLE: !Sub "${Environment}-products"
+          USERS_TABLE: !Sub "${Environment}-users"
+          ORDERS_TABLE: !Sub "${Environment}-orders"
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+
+          const PRODUCTS_TABLE = process.env.PRODUCTS_TABLE;
+          const USERS_TABLE = process.env.USERS_TABLE;
+          const ORDERS_TABLE = process.env.ORDERS_TABLE;
+
+          exports.handler = async (event) => {
+              console.log('Search Service Event:', JSON.stringify(event, null, 2));
+              const { httpMethod, pathParameters, queryStringParameters } = event;
+              
+              try {
+                  if (httpMethod === 'GET') {
+                      const searchType = pathParameters?.searchType || 'products';
+                      const query = queryStringParameters?.q || '';
+                      const filters = extractFilters(queryStringParameters);
+                      
+                      return await performSearch(searchType, query, filters);
+                  }
+                  
+                  return {
+                      statusCode: 405,
+                      body: JSON.stringify({ message: 'Method not allowed' })
+                  };
+              } catch (error) {
+                  console.error('Error:', error);
+                  return {
+                      statusCode: 500,
+                      body: JSON.stringify({ message: 'Internal server error', error: error.message })
+                  };
+              }
+          };
+
+          function extractFilters(queryParams) {
+              const filters = {};
+              
+              if (queryParams) {
+                  if (queryParams.category) filters.category = queryParams.category;
+                  if (queryParams.brand) filters.brand = queryParams.brand;
+                  if (queryParams.minPrice) filters.minPrice = parseFloat(queryParams.minPrice);
+                  if (queryParams.maxPrice) filters.maxPrice = parseFloat(queryParams.maxPrice);
+                  if (queryParams.country) filters.country = queryParams.country;
+                  if (queryParams.status) filters.status = queryParams.status;
+                  if (queryParams.limit) filters.limit = parseInt(queryParams.limit);
+                  if (queryParams.offset) filters.offset = parseInt(queryParams.offset);
+              }
+              
+              return filters;
+          }
+
+          async function performSearch(searchType, query, filters) {
+              let results;
+              
+              switch (searchType) {
+                  case 'products':
+                      results = await searchProducts(query, filters);
+                      break;
+                  case 'users':
+                      results = await searchUsers(query, filters);
+                      break;
+                  case 'orders':
+                      results = await searchOrders(query, filters);
+                      break;
+                  default:
+                      return {
+                          statusCode: 400,
+                          body: JSON.stringify({ message: 'Invalid search type' })
+                      };
+              }
+              
+              return {
+                  statusCode: 200,
+                  headers: {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  body: JSON.stringify({
+                      searchType,
+                      query,
+                      filters,
+                      results: results.items,
+                      total: results.total,
+                      hasMore: results.hasMore
+                  })
+              };
+          }
+
+          async function searchProducts(query, filters) {
+              let params = { TableName: PRODUCTS_TABLE };
+              let filterExpressions = [];
+              let expressionAttributeValues = {};
+              let expressionAttributeNames = {};
+              
+              // Text search in name and description
+              if (query) {
+                  filterExpressions.push('(contains(#name, :query) OR contains(description, :query))');
+                  expressionAttributeNames['#name'] = 'name';
+                  expressionAttributeValues[':query'] = query;
+              }
+              
+              // Category filter
+              if (filters.category) {
+                  filterExpressions.push('category = :category');
+                  expressionAttributeValues[':category'] = filters.category;
+              }
+              
+              // Brand filter
+              if (filters.brand) {
+                  filterExpressions.push('brand = :brand');
+                  expressionAttributeValues[':brand'] = filters.brand;
+              }
+              
+              // Price range filter
+              if (filters.minPrice !== undefined) {
+                  filterExpressions.push('price >= :minPrice');
+                  expressionAttributeValues[':minPrice'] = filters.minPrice;
+              }
+              
+              if (filters.maxPrice !== undefined) {
+                  filterExpressions.push('price <= :maxPrice');
+                  expressionAttributeValues[':maxPrice'] = filters.maxPrice;
+              }
+              
+              // Country filter
+              if (filters.country) {
+                  filterExpressions.push('country = :country');
+                  expressionAttributeValues[':country'] = filters.country;
+              }
+              
+              // Status filter
+              if (filters.status) {
+                  filterExpressions.push('#status = :status');
+                  expressionAttributeNames['#status'] = 'status';
+                  expressionAttributeValues[':status'] = filters.status;
+              }
+              
+              // Build filter expression
+              if (filterExpressions.length > 0) {
+                  params.FilterExpression = filterExpressions.join(' AND ');
+                  params.ExpressionAttributeValues = expressionAttributeValues;
+                  if (Object.keys(expressionAttributeNames).length > 0) {
+                      params.ExpressionAttributeNames = expressionAttributeNames;
+                  }
+              }
+              
+              // Add pagination
+              if (filters.limit) {
+                  params.Limit = filters.limit;
+              }
+              
+              const result = await dynamodb.scan(params).promise();
+              
+              // Apply offset if specified (simple implementation)
+              let items = result.Items;
+              if (filters.offset) {
+                  items = items.slice(filters.offset);
+              }
+              
+              return {
+                  items,
+                  total: result.Count,
+                  hasMore: !!result.LastEvaluatedKey
+              };
+          }
+
+          async function searchUsers(query, filters) {
+              let params = { TableName: USERS_TABLE };
+              let filterExpressions = [];
+              let expressionAttributeValues = {};
+              
+              // Text search in email, firstName, lastName
+              if (query) {
+                  filterExpressions.push('(contains(email, :query) OR contains(firstName, :query) OR contains(lastName, :query))');
+                  expressionAttributeValues[':query'] = query;
+              }
+              
+              // Country filter
+              if (filters.country) {
+                  filterExpressions.push('country = :country');
+                  expressionAttributeValues[':country'] = filters.country;
+              }
+              
+              // Status filter
+              if (filters.status) {
+                  filterExpressions.push('#status = :status');
+                  params.ExpressionAttributeNames = { '#status': 'status' };
+                  expressionAttributeValues[':status'] = filters.status;
+              }
+              
+              if (filterExpressions.length > 0) {
+                  params.FilterExpression = filterExpressions.join(' AND ');
+                  params.ExpressionAttributeValues = expressionAttributeValues;
+              }
+              
+              if (filters.limit) {
+                  params.Limit = filters.limit;
+              }
+              
+              const result = await dynamodb.scan(params).promise();
+              
+              let items = result.Items;
+              if (filters.offset) {
+                  items = items.slice(filters.offset);
+              }
+              
+              return {
+                  items,
+                  total: result.Count,
+                  hasMore: !!result.LastEvaluatedKey
+              };
+          }
+
+          async function searchOrders(query, filters) {
+              let params = { TableName: ORDERS_TABLE };
+              let filterExpressions = [];
+              let expressionAttributeValues = {};
+              
+              // Search by order ID or user ID
+              if (query) {
+                  filterExpressions.push('(contains(orderId, :query) OR contains(userId, :query))');
+                  expressionAttributeValues[':query'] = query;
+              }
+              
+              // Status filter
+              if (filters.status) {
+                  filterExpressions.push('#status = :status');
+                  params.ExpressionAttributeNames = { '#status': 'status' };
+                  expressionAttributeValues[':status'] = filters.status;
+              }
+              
+              if (filterExpressions.length > 0) {
+                  params.FilterExpression = filterExpressions.join(' AND ');
+                  params.ExpressionAttributeValues = expressionAttributeValues;
+              }
+              
+              if (filters.limit) {
+                  params.Limit = filters.limit;
+              }
+              
+              const result = await dynamodb.scan(params).promise();
+              
+              let items = result.Items;
+              if (filters.offset) {
+                  items = items.slice(filters.offset);
+              }
+              
+              return {
+                  items,
+                  total: result.Count,
+                  hasMore: !!result.LastEvaluatedKey
+              };
+          }
+
+  # ============================================================================
+  # API GATEWAY
+  # ============================================================================
+
+  EcommerceApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${Environment}-ecommerce-api"
+      Description: "E-commerce Microservices API"
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Policy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: "*"
+            Action: "execute-api:Invoke"
+            Resource: "*"
+
+  # API Gateway Resources and Methods would go here
+  # (Truncated for brevity - would include all REST API endpoints)
+
+  # ============================================================================
+  # EVENTBRIDGE RULES
+  # ============================================================================
+
+  NotificationEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${Environment}-ecommerce-notification-rule"
+      Description: "Route events to notification service"
+      EventBusName: !Sub "${Environment}-ecommerce-events"
+      EventPattern:
+        source:
+          - "ecommerce.user"
+          - "ecommerce.order"
+          - "ecommerce.payment"
+          - "ecommerce.inventory"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt NotificationServiceFunction.Arn
+          Id: "NotificationTarget"
+
+  # Lambda Permissions for EventBridge
+  NotificationEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref NotificationServiceFunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt NotificationEventRule.Arn
+
+Outputs:
+  PaymentServiceArn:
+    Description: "Payment Service Lambda ARN"
+    Value: !GetAtt PaymentServiceFunction.Arn
+    Export:
+      Name: !Sub "${Environment}-payment-service-arn"
+
+  InventoryServiceArn:
+    Description: "Inventory Service Lambda ARN"
+    Value: !GetAtt InventoryServiceFunction.Arn
+    Export:
+      Name: !Sub "${Environment}-inventory-service-arn"
+
+  NotificationServiceArn:
+    Description: "Notification Service Lambda ARN"
+    Value: !GetAtt NotificationServiceFunction.Arn
+    Export:
+      Name: !Sub "${Environment}-notification-service-arn"
+
+  AnalyticsServiceArn:
+    Description: "Analytics Service Lambda ARN"
+    Value: !GetAtt AnalyticsServiceFunction.Arn
+    Export:
+      Name: !Sub "${Environment}-analytics-service-arn"
+
+  SearchServiceArn:
+    Description: "Search Service Lambda ARN"
+    Value: !GetAtt SearchServiceFunction.Arn
+    Export:
+      Name: !Sub "${Environment}-search-service-arn"
+
+  ApiGatewayUrl:
+    Description: "API Gateway URL"
+    Value: !Sub "https://${EcommerceApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "${Environment}-api-gateway-url"
